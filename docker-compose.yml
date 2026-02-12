@@ -1,0 +1,17 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  qwen-rag:
+    build: .
+    container_name: qwen-rag-assistant
+    volumes:
+      - ./data:/app/data
+      - ./recordings:/app/recordings
+      - ~/.cache/huggingface:/root/.cache/huggingface  # 共享模型缓存
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - HF_ENDPOINT=https://hf-mirror.com
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
