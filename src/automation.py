@@ -11,23 +11,13 @@ from .models import EmbeddingModel
 from .document_processor import DocumentVectorStore
 
 class MouseRecorder:
-    """鼠标录制器（后台线程）"""
     def __init__(self):
         self.recording = False
-        self.events = []   # 存储(时间戳, x, y, event_type)
+        self.events = []
         self.listener = None
     
-    def _on_move(self, x, y):
-        if self.recording:
-            self.events.append((time.time(), x, y, "move"))
-    
-    def _on_click(self, x, y, button, pressed):
-        if self.recording:
-            btn = str(button).split('.')[-1]  # left, right, middle
-            self.events.append((time.time(), x, y, f"click_{btn}_{pressed}"))
-    
     def start(self):
-        self.events = []
+        self.events = []  # 清空之前的事件
         self.recording = True
         self.listener = mouse.Listener(on_move=self._on_move, on_click=self._on_click)
         self.listener.start()
@@ -40,7 +30,14 @@ class MouseRecorder:
     
     def save(self, name: str) -> str:
         """保存轨迹到JSON文件，返回文件路径"""
+        if not self.events:
+            raise ValueError("没有录制到任何事件")
         file_path = config.RECORDINGS_DIR / f"{name}.json"
+        # 避免覆盖，自动重命名
+        counter = 1
+        while file_path.exists():
+            file_path = config.RECORDINGS_DIR / f"{name}_{counter}.json"
+            counter += 1
         with open(file_path, "w") as f:
             json.dump(self.events, f, indent=2)
         return str(file_path)

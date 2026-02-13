@@ -159,82 +159,264 @@ class App:
             self.record_status.config(text=f"录制结束，共{len(events)}个事件")
     
     def save_behavior(self):
+        # 检查是否有录制事件
         if not hasattr(self.recorder, 'events') or not self.recorder.events:
-            messagebox.showwarning("提示", "请先录制轨迹")
+            messagebox.showwarning("提示", "请先录制轨迹（点击开始录制，移动鼠标并点击，然后停止）")
             return
         name = self.behavior_name.get().strip()
         desc = self.behavior_desc.get().strip()
         if not name:
             messagebox.showwarning("提示", "请输入行为名称")
             return
-        # 保存JSON
-        file_path = self.recorder.save(name)
-        # 存入行为库
-        self.behavior_lib.add_behavior(name, desc, file_path)
-        messagebox.showinfo("成功", f"行为 '{name}' 已保存")
-        # 清空输入
-        self.behavior_name.delete(0, tk.END)
-        self.behavior_desc.delete(0, tk.END)
+        try:
+            file_path = self.recorder.save(name)
+            # 存入行为库
+            self.behavior_lib.add_behavior(name, desc, file_path)
+            messagebox.showinfo("成功", f"行为 '{name}' 已保存\n路径: {file_path}")
+            # 清空输入
+            self.behavior_name.delete(0, tk.END)
+            self.behavior_desc.delete(0, tk.END)
+            # 清空录制事件，避免下次保存重复
+            self.recorder.events = []
+            self.record_status.config(text="已保存，可重新录制")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
     
     def search_and_replay(self):
         query = self.behavior_query.get().strip()
         if not query:
             messagebox.showwarning("提示", "请输入关键词")
             return
-        file_path, score = self.behavior_lib.search_behavior(query)
-        if file_path:
-            self.search_result.config(text=f"匹配行为，相似度{score:.2f}，开始回放")
-            # 在新线程中回放，避免阻塞GUI
-            threading.Thread(target=replay_mouse, args=(file_path,), daemon=True).start()
-        else:
+        # 检索多个结果（可调阈值）
+        results = self.behavior_lib.vector_store.search(query, top_k=3)
+        if not results:
             self.search_result.config(text="未找到匹配行为")
+            return
+        
+        # 显示检索结果供用户选择（简单起见，取第一个）
+        best = results[0]
+        file_path = best['source']
+        score = best['score']
+        
+        if score < config.BEHAVIOR_SIMILARITY_THRESHOLD:
+            self.search_result.config(text=f"相似度{score:.2f}低于阈值，不执行")
+            return
+        
+        self.search_result.config(text=f"匹配行为，相似度{score:.2f}，开始回放...")
+        
+        def replay_task():
+            try:
+                replay_mouse(file_path)
+                self.root.after(0, lambda: self.search_result.config(text="回放完成"))
+            except Exception as e:
+                self.root.after(0, lambda: self.search_result.config(text=f"回放失败: {e}"))
+        
+        threading.Thread(target=replay_task, daemon=True).start()
     
     # ---------- 记忆管理标签页 ----------
     def create_memory_tab(self):
+        """记忆管理标签页（完整 CRUD）"""
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="记忆管理")
+
+        # ========== 顶部：手动添加记忆 ==========
+        frame_add = ttk.LabelFrame(tab, text="添加新记忆")
+        frame_add.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(frame_add, text="内容:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        self.new_memory_entry = ttk.Entry(frame_add, width=70)
+        self.new_memory_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        btn_add = ttk.Button(frame_add, text="添加", command=self.add_memory)
+        btn_add.grid(row=0, column=2, padx=5, pady=5)
+        frame_add.grid_columnconfigure(1, weight=1)
+
+        # ========== 中间：记忆列表（可多选删除） ==========
+        frame_list = ttk.LabelFrame(tab, text="已存储的记忆")
+        frame_list.pack(fill='both', expand=True, padx=10, pady=5)
+
+        # 创建 Treeview，添加复选框列
+        columns = ("选中", "序号", "内容", "来源", "操作")
+        self.memory_tree = ttk.Treeview(frame_list, columns=columns, show="headings", height=15)
         
-        # 显示历史对话
-        ttk.Label(tab, text="最近对话记忆（可检索）").pack(pady=5)
-        self.memory_text = scrolledtext.ScrolledText(tab, width=80, height=25)
-        self.memory_text.pack(fill='both', expand=True, padx=10, pady=5)
+        # 设置列标题
+        self.memory_tree.heading("选中", text="✅")
+        self.memory_tree.heading("序号", text="#")
+        self.memory_tree.heading("内容", text="记忆内容")
+        self.memory_tree.heading("来源", text="来源")
+        self.memory_tree.heading("操作", text="删除")
         
-        # 刷新按钮
-        btn_refresh = ttk.Button(tab, text="刷新记忆", command=self.refresh_memory)
-        btn_refresh.pack(pady=5)
+        # 设置列宽
+        self.memory_tree.column("选中", width=40, anchor='center')
+        self.memory_tree.column("序号", width=50, anchor='center')
+        self.memory_tree.column("内容", width=450)
+        self.memory_tree.column("来源", width=100)
+        self.memory_tree.column("操作", width=80, anchor='center')
+
+        # 滚动条
+        scrollbar = ttk.Scrollbar(frame_list, orient="vertical", command=self.memory_tree.yview)
+        self.memory_tree.configure(yscrollcommand=scrollbar.set)
+        self.memory_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # 绑定点击事件（用于复选框切换和删除按钮）
+        self.memory_tree.bind('<ButtonRelease-1>', self.on_memory_tree_click)
+
+        # ========== 底部：操作按钮 + 检索 ==========
+        frame_bottom = ttk.Frame(tab)
+        frame_bottom.pack(fill='x', padx=10, pady=5)
+
+        # 左侧按钮组
+        btn_frame = ttk.Frame(frame_bottom)
+        btn_frame.pack(side='left', fill='x', expand=True)
         
-        # 简单检索测试
-        frame_search = ttk.Frame(tab)
-        frame_search.pack(fill='x', padx=10, pady=5)
-        ttk.Label(frame_search, text="检索记忆:").pack(side='left')
-        self.memory_query = ttk.Entry(frame_search, width=40)
-        self.memory_query.pack(side='left', padx=5)
-        btn_search_mem = ttk.Button(frame_search, text="检索", command=self.search_memory)
-        btn_search_mem.pack(side='left')
+        btn_delete_selected = ttk.Button(btn_frame, text="删除选中", command=self.delete_selected_memories)
+        btn_delete_selected.pack(side='left', padx=5)
         
-        self.refresh_memory()
+        btn_clear_all = ttk.Button(btn_frame, text="清空全部", command=self.clear_all_memories)
+        btn_clear_all.pack(side='left', padx=5)
+        
+        btn_refresh = ttk.Button(btn_frame, text="刷新列表", command=self.refresh_memory_list)
+        btn_refresh.pack(side='left', padx=5)
+
+        # 右侧检索框
+        search_frame = ttk.Frame(frame_bottom)
+        search_frame.pack(side='right')
+        ttk.Label(search_frame, text="检索:").pack(side='left')
+        self.memory_search_entry = ttk.Entry(search_frame, width=25)
+        self.memory_search_entry.pack(side='left', padx=5)
+        btn_search = ttk.Button(search_frame, text="搜索", command=self.search_memory)
+        btn_search.pack(side='left')
+        
+        # 初始化显示列表
+        self.refresh_memory_list()
     
-    def refresh_memory(self):
-        """从向量库加载最近记忆并显示（简单展示元数据）"""
-        # 由于没有直接获取全部，这里展示metadata的前50条
-        self.memory_text.delete(1.0, tk.END)
-        if self.memory.vector_store.metadata:
-            for i, item in enumerate(self.memory.vector_store.metadata[-20:]):
-                self.memory_text.insert(tk.END, f"{i+1}. {item['text'][:200]}...\n\n")
-        else:
-            self.memory_text.insert(tk.END, "暂无记忆")
-    
-    def search_memory(self):
-        query = self.memory_query.get().strip()
-        if not query:
+    def refresh_memory_list(self):
+        """刷新记忆列表（从 memory 对象加载最新数据）"""
+        # 清空现有行
+        for row in self.memory_tree.get_children():
+            self.memory_tree.delete(row)
+        
+        # 获取所有记忆
+        memories = self.memory.get_all_memories(limit=100)
+        
+        # 插入数据
+        for idx, mem in enumerate(memories):
+            # 内容截断显示
+            content = mem['text']
+            if len(content) > 60:
+                content = content[:60] + "..."
+            
+            # 插入行，第0列留空（复选框用变量存储状态）
+            item_id = self.memory_tree.insert('', 'end', values=(
+                '□',          # 复选框（未选中）
+                idx + 1,      # 序号
+                content,
+                mem['source'],
+                '🗑️ 删除'     # 删除按钮文本
+            ))
+            # 存储完整内容以备查看
+            self.memory_tree.set(item_id, column='内容', value=content)
+            # 可以将完整内容作为隐藏数据存储（可选）
+            self.memory_tree.item(item_id, tags=(str(idx),))  # 用 tags 存储原始索引
+
+    def add_memory(self):
+        """手动添加记忆"""
+        content = self.new_memory_entry.get().strip()
+        if not content:
+            messagebox.showwarning("提示", "请输入记忆内容")
             return
-        results = self.memory.retrieve_relevant(query)
-        self.memory_text.delete(1.0, tk.END)
-        if results:
-            for r in results:
-                self.memory_text.insert(tk.END, f"相似度: {r['score']:.3f}\n{r['text']}\n\n")
-        else:
-            self.memory_text.insert(tk.END, "未找到相关记忆")
+        try:
+            self.memory.add_memory(content, source="manual")
+            messagebox.showinfo("成功", "记忆已添加")
+            self.new_memory_entry.delete(0, tk.END)
+            self.refresh_memory_list()
+        except Exception as e:
+            messagebox.showerror("错误", f"添加失败: {e}")
+
+    def on_memory_tree_click(self, event):
+        """处理 Treeview 点击事件（复选框切换、删除按钮）"""
+        region = self.memory_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        
+        column = self.memory_tree.identify_column(event.x)
+        row_id = self.memory_tree.identify_row(event.y)
+        if not row_id:
+            return
+        
+        # 点击“操作”列（删除按钮）
+        if column == '#5':  # 第5列是“操作”
+            # 获取该行的原始索引（从 tags 或序号）
+            item_values = self.memory_tree.item(row_id, 'values')
+            idx = int(item_values[1]) - 1  # 序号从1开始，转0基
+            if messagebox.askyesno("确认删除", f"确定要删除这条记忆吗？"):
+                if self.memory.delete_memory(idx):
+                    messagebox.showinfo("成功", "记忆已删除")
+                    self.refresh_memory_list()
+                else:
+                    messagebox.showerror("错误", "删除失败")
+            return
+        
+        # 点击“选中”列（复选框）
+        if column == '#1':
+            current_val = self.memory_tree.item(row_id, 'values')[0]
+            new_val = '☑' if current_val == '□' else '□'
+            self.memory_tree.set(row_id, column='选中', value=new_val)
+
+    def delete_selected_memories(self):
+        """删除所有被选中的记忆"""
+        selected_indices = []
+        for row_id in self.memory_tree.get_children():
+            if self.memory_tree.item(row_id, 'values')[0] == '☑':
+                idx = int(self.memory_tree.item(row_id, 'values')[1]) - 1
+                selected_indices.append(idx)
+        
+        if not selected_indices:
+            messagebox.showwarning("提示", "请先勾选要删除的记忆")
+            return
+        
+        # 从后往前删除，避免索引变化
+        if messagebox.askyesno("确认删除", f"确定要删除选中的 {len(selected_indices)} 条记忆吗？"):
+            for idx in sorted(selected_indices, reverse=True):
+                self.memory.delete_memory(idx)
+            self.refresh_memory_list()
+            messagebox.showinfo("成功", f"已删除 {len(selected_indices)} 条记忆")
+
+    def clear_all_memories(self):
+        """清空所有记忆"""
+        if messagebox.askyesno("警告", "确定要清空所有记忆吗？此操作不可恢复！"):
+            self.memory.clear_all()
+            self.refresh_memory_list()
+            messagebox.showinfo("成功", "所有记忆已清空")
+
+    def search_memory(self):
+        """检索记忆并显示结果"""
+        query = self.memory_search_entry.get().strip()
+        if not query:
+            messagebox.showwarning("提示", "请输入检索关键词")
+            return
+        
+        results = self.memory.retrieve_relevant(query, top_k=10)
+        
+        # 清空现有列表，显示检索结果
+        for row in self.memory_tree.get_children():
+            self.memory_tree.delete(row)
+        
+        if not results:
+            self.memory_tree.insert('', 'end', values=('', '', '未找到相关记忆', '', ''))
+            return
+        
+        for idx, res in enumerate(results):
+            content = res['text']
+            if len(content) > 60:
+                content = content[:60] + "..."
+            self.memory_tree.insert('', 'end', values=(
+                '□',
+                idx + 1,
+                content,
+                f"{res['source']} (相似度{res['score']:.2f})",
+                '🗑️ 删除'
+            ))
     
     # ---------- 设置 ----------
     def set_api_key(self):
@@ -256,6 +438,7 @@ class App:
                 dialog.destroy()
         
         ttk.Button(dialog, text="保存", command=save_key).pack(pady=10)
+
 
 # 启动主程序
 def run_gui():
