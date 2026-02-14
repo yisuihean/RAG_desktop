@@ -8,6 +8,7 @@ from .document_processor import parse_document, split_text
 from .automation import MouseRecorder, BehaviorLibrary, replay_mouse, ScriptBuilder, HAS_CV2
 from .memory import ConversationMemory
 from .models import DeepSeekAPI, EmbeddingModel
+from .config_manager import set_api_key as save_api_key, get_api_key  # 新增导入
 
 class App:
     def __init__(self, root):
@@ -40,6 +41,11 @@ class App:
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="设置", menu=settings_menu)
         settings_menu.add_command(label="配置API密钥", command=self.set_api_key)
+        
+        # 启动时检查 API key 是否已设置
+        if not config.DEEPSEEK_API_KEY:
+            self.root.after(100, lambda: messagebox.showwarning("提示", "请先设置 DeepSeek API 密钥"))
+            self.root.after(200, self.set_api_key)  # 延迟弹出设置窗口
     
     def on_recording_stopped(self, event_count):
         """当录制停止时的回调函数（F2 触发或按钮触发）"""
@@ -831,7 +837,7 @@ class App:
                 '[删除]'
             ))
     
-    # ---------- 设置 ----------
+    # ---------- 修改后的设置方法 ----------
     def set_api_key(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("设置API密钥")
@@ -839,15 +845,25 @@ class App:
         ttk.Label(dialog, text="DeepSeek API Key:").pack(pady=10)
         key_entry = ttk.Entry(dialog, width=50)
         key_entry.pack(pady=5)
-        key_entry.insert(0, config.DEEPSEEK_API_KEY)
+        # 显示当前保存的 key（如果有）
+        current_key = get_api_key()
+        key_entry.insert(0, current_key)
         
         def save_key():
             new_key = key_entry.get().strip()
             if new_key:
+                # 保存到配置文件
+                save_api_key(new_key)
+                # 更新内存中的配置变量
+                import src.config as config
                 config.DEEPSEEK_API_KEY = new_key
+                # 重新创建 LLM 实例（使新 key 生效）
+                from .models import DeepSeekAPI
                 self.rag.llm = DeepSeekAPI(new_key)
-                messagebox.showinfo("成功", "API密钥已更新")
+                messagebox.showinfo("成功", "API密钥已保存")
                 dialog.destroy()
+            else:
+                messagebox.showwarning("提示", "请输入API密钥")
         
         ttk.Button(dialog, text="保存", command=save_key).pack(pady=10)
 
