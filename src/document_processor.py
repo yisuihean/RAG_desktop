@@ -84,11 +84,29 @@ def parse_document(file_path: str) -> str:
         raise ValueError(f"不支持的文件格式: {ext}")
     return text
 
-def split_text(text: str, chunk_size=config.CHUNK_SIZE, overlap=config.CHUNK_OVERLAP) -> List[str]:
+def split_text(text: str, chunk_size=300, overlap=30) -> List[str]:
+    """
+    将文本分割成小块，防止内存溢出
+    chunk_size: 从500减小到300
+    overlap: 从50减小到30
+    """
+    if len(text) > 10 * 1024 * 1024:  # 如果文件大于10MB
+        print("警告：文件较大，正在优化处理...")
+        chunk_size = 200  # 进一步减小块大小
+        overlap = 20
+    
     chunks = []
     start = 0
-    while start < len(text):
-        end = start + chunk_size
+    total_len = len(text)
+    
+    while start < total_len:
+        end = min(start + chunk_size, total_len)
         chunks.append(text[start:end])
         start = end - overlap
+        
+        # 每处理100个块输出一次进度
+        if len(chunks) % 100 == 0:
+            print(f"已处理 {len(chunks)} 个文本块...")
+    
+    print(f"文件分割完成，共 {len(chunks)} 个块")
     return chunks

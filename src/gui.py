@@ -1,27 +1,29 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import threading
 from pathlib import Path
 from . import config
 from .rag_core import RAGEngine
 from .document_processor import parse_document, split_text
-from .automation import MouseRecorder, BehaviorLibrary, replay_mouse
+from .automation import MouseRecorder, BehaviorLibrary, replay_mouse, ScriptBuilder, HAS_CV2
 from .memory import ConversationMemory
 from .models import DeepSeekAPI, EmbeddingModel
-import tkinter.font as tkfont
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("RAG桌面助手 - 红岩网校考核")
-        self.root.geometry("900x700")
+        self.root.geometry("1000x750")
         
         # 初始化核心组件
         self.rag = RAGEngine()
-        self.recorder = MouseRecorder()
+        self.recorder = MouseRecorder(on_stop_callback=self.on_recording_stopped)
         self.behavior_lib = BehaviorLibrary()
         self.memory = ConversationMemory()
         self.embed_model = EmbeddingModel()
+        
+        # 回放速度因子
+        self.replay_speed = tk.DoubleVar(value=1.0)
         
         # 创建标签页
         self.notebook = ttk.Notebook(root)
@@ -29,6 +31,7 @@ class App:
         
         self.create_rag_tab()
         self.create_automation_tab()
+        self.create_behavior_repo_tab()
         self.create_memory_tab()
         
         # 菜单栏（设置API Key）
@@ -37,6 +40,16 @@ class App:
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="设置", menu=settings_menu)
         settings_menu.add_command(label="配置API密钥", command=self.set_api_key)
+    
+    def on_recording_stopped(self, event_count):
+        """当录制停止时的回调函数（F2 触发或按钮触发）"""
+        self.root.after(0, self._update_ui_after_stop, event_count)
+    
+    def _update_ui_after_stop(self, event_count):
+        """更新 GUI 状态"""
+        self.btn_record.config(text="开始录制")
+        self.record_status.config(text=f"录制结束，共{event_count}个事件，可保存")
+        print(f"GUI 状态已更新: 录制结束，{event_count} 个事件")
     
     # ---------- 文档问答标签页 ----------
     def create_rag_tab(self):
@@ -55,14 +68,12 @@ class App:
         frame_qa = ttk.LabelFrame(tab, text="问答")
         frame_qa.pack(fill='both', expand=True, padx=10, pady=5)
         
-        # 问题输入
         ttk.Label(frame_qa, text="问题:").grid(row=0, column=0, sticky='w', padx=5, pady=5)
         self.question_entry = ttk.Entry(frame_qa, width=60)
         self.question_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
         btn_ask = ttk.Button(frame_qa, text="提问", command=self.ask_question)
         btn_ask.grid(row=0, column=2, padx=5, pady=5)
         
-        # 答案显示
         ttk.Label(frame_qa, text="回答:").grid(row=1, column=0, sticky='nw', padx=5, pady=5)
         self.answer_text = scrolledtext.ScrolledText(frame_qa, width=70, height=20, wrap=tk.WORD)
         self.answer_text.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky='nsew')
@@ -77,11 +88,9 @@ class App:
         if not file_path:
             return
         try:
-            # 解析文档
             text = parse_document(file_path)
             chunks = split_text(text)
             sources = [Path(file_path).name] * len(chunks)
-            # 添加到向量库
             self.rag.doc_store.add_documents(chunks, sources)
             self.lbl_upload_status.config(text=f"已上传并索引: {Path(file_path).name} ({len(chunks)}块)")
             messagebox.showinfo("成功", "文档已处理并加入知识库")
@@ -93,18 +102,12 @@ class App:
         if not question:
             messagebox.showwarning("提示", "请输入问题")
             return
-        # 启用加载提示（此处可加）
         self.answer_text.delete(1.0, tk.END)
-        self.answer_text.insert(tk.END, "正在生成答案...")
+        self.answer_text.insert(tk.END, "正在思考...")
         
         def task():
-            # 检索记忆（可选增强）
-            memories = self.memory.retrieve_relevant(question)
-            # 目前RAGEngine未集成记忆，可自行扩展，简单起见先只做文档检索
             answer = self.rag.answer_question(question)
-            # 存储对话记忆
             self.memory.add_dialogue(question, answer)
-            # 更新界面
             self.root.after(0, lambda: self.answer_text.delete(1.0, tk.END))
             self.root.after(0, lambda: self.answer_text.insert(tk.END, answer))
         
@@ -113,7 +116,7 @@ class App:
     # ---------- 行为自动化标签页 ----------
     def create_automation_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="行为自动化")
+        self.notebook.add(tab, text="行为录制")
         
         # 录制控制
         frame_record = ttk.LabelFrame(tab, text="鼠标轨迹录制")
@@ -135,8 +138,26 @@ class App:
         btn_save = ttk.Button(frame_save, text="保存轨迹", command=self.save_behavior)
         btn_save.pack(side='left', padx=5)
         
-        # 行为检索与回放
-        frame_query = ttk.LabelFrame(tab, text="检索行为并执行")
+        # 新增：新建脚本按钮
+        btn_new_script = ttk.Button(frame_record, text="新建脚本", command=self.open_script_builder)
+        btn_new_script.pack(side='left', padx=5)
+        
+        # 回放速度调节
+        frame_speed = ttk.LabelFrame(tab, text="回放速度")
+        frame_speed.pack(fill='x', padx=10, pady=5)
+        ttk.Label(frame_speed, text="速度因子:").pack(side='left', padx=5)
+        speed_scale = ttk.Scale(frame_speed, from_=0.2, to=3.0, orient='horizontal',
+                                 variable=self.replay_speed, length=200)
+        speed_scale.pack(side='left', padx=5)
+        self.speed_label = ttk.Label(frame_speed, text="1.0x")
+        self.speed_label.pack(side='left', padx=5)
+        # 更新速度显示
+        def update_speed_label(*args):
+            self.speed_label.config(text=f"{self.replay_speed.get():.1f}x")
+        self.replay_speed.trace_add('write', update_speed_label)
+        
+        # 快速检索与回放
+        frame_query = ttk.LabelFrame(tab, text="快速检索并执行")
         frame_query.pack(fill='x', padx=10, pady=5)
         ttk.Label(frame_query, text="关键词:").pack(side='left', padx=5)
         self.behavior_query = ttk.Entry(frame_query, width=40)
@@ -148,78 +169,499 @@ class App:
     
     def toggle_record(self):
         if not self.recorder.recording:
-            # 开始录制
             self.recorder.start()
             self.btn_record.config(text="停止录制")
-            self.record_status.config(text="正在录制...")
+            self.record_status.config(text="正在录制... (按 F2 停止)")
+            print("开始录制...")
         else:
-            # 停止录制
             events = self.recorder.stop()
             self.btn_record.config(text="开始录制")
-            self.record_status.config(text=f"录制结束，共{len(events)}个事件")
+            self.record_status.config(text=f"录制结束，共{len(events)}个事件，可保存")
+            print(f"停止录制，{len(events)} 个事件")
     
     def save_behavior(self):
-        # 检查是否有录制事件
-        if not hasattr(self.recorder, 'events') or not self.recorder.events:
-            messagebox.showwarning("提示", "请先录制轨迹（点击开始录制，移动鼠标并点击，然后停止）")
+        if not self.recorder.has_recorded_data():
+            messagebox.showwarning("提示", "请先录制轨迹！\n\n步骤：\n1. 点击'开始录制'\n2. 移动鼠标并点击\n3. 按 F2 或点击'停止录制'\n4. 输入名称和描述\n5. 点击'保存轨迹'")
             return
+        
         name = self.behavior_name.get().strip()
         desc = self.behavior_desc.get().strip()
+        
         if not name:
             messagebox.showwarning("提示", "请输入行为名称")
             return
+        
         try:
             file_path = self.recorder.save(name)
-            # 存入行为库
+            print(f"轨迹文件已保存: {file_path}")
             self.behavior_lib.add_behavior(name, desc, file_path)
-            messagebox.showinfo("成功", f"行为 '{name}' 已保存\n路径: {file_path}")
-            # 清空输入
+            messagebox.showinfo("成功", f"行为 '{name}' 已保存并建立索引！\n路径: {file_path}")
+            
             self.behavior_name.delete(0, tk.END)
             self.behavior_desc.delete(0, tk.END)
-            # 清空录制事件，避免下次保存重复
             self.recorder.events = []
             self.record_status.config(text="已保存，可重新录制")
+            self.refresh_behavior_list()
         except Exception as e:
-            messagebox.showerror("保存失败", str(e))
+            print(f"保存失败: {e}")
+            messagebox.showerror("保存失败", f"保存行为时出错:\n{str(e)}")
     
     def search_and_replay(self):
         query = self.behavior_query.get().strip()
         if not query:
             messagebox.showwarning("提示", "请输入关键词")
             return
-        # 检索多个结果（可调阈值）
-        results = self.behavior_lib.vector_store.search(query, top_k=3)
+        results = self.behavior_lib.search_behavior(query, top_k=3)
         if not results:
             self.search_result.config(text="未找到匹配行为")
             return
         
-        # 显示检索结果供用户选择（简单起见，取第一个）
         best = results[0]
-        file_path = best['source']
+        file_path = best['file_path']
         score = best['score']
+        name = best['name']
+        speed = self.replay_speed.get()
         
-        if score < config.BEHAVIOR_SIMILARITY_THRESHOLD:
-            self.search_result.config(text=f"相似度{score:.2f}低于阈值，不执行")
-            return
-        
-        self.search_result.config(text=f"匹配行为，相似度{score:.2f}，开始回放...")
+        self.search_result.config(text=f"匹配 '{name}'，相似度{score:.2f}，速度{speed:.1f}x，开始回放...")
         
         def replay_task():
             try:
-                replay_mouse(file_path)
+                replay_mouse(file_path, speed_factor=speed)
                 self.root.after(0, lambda: self.search_result.config(text="回放完成"))
             except Exception as e:
                 self.root.after(0, lambda: self.search_result.config(text=f"回放失败: {e}"))
         
         threading.Thread(target=replay_task, daemon=True).start()
     
+    # ---------- 新增：脚本构建窗口 ----------
+    def open_script_builder(self):
+        """打开脚本构建器窗口"""
+        builder_win = tk.Toplevel(self.root)
+        builder_win.title("新建自动化脚本")
+        builder_win.geometry("700x550")
+        
+        # 步骤列表
+        frame_list = ttk.LabelFrame(builder_win, text="步骤列表")
+        frame_list.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # 使用 Listbox 显示步骤
+        self.script_listbox = tk.Listbox(frame_list, height=8)
+        self.script_listbox.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+        scrollbar = ttk.Scrollbar(frame_list, orient='vertical', command=self.script_listbox.yview)
+        scrollbar.pack(side='right', fill='y')
+        self.script_listbox.config(yscrollcommand=scrollbar.set)
+        
+        # 删除按钮
+        btn_delete_step = ttk.Button(frame_list, text="删除选中步骤", command=self.delete_selected_step)
+        btn_delete_step.pack(pady=5)
+        
+        # 步骤编辑区域
+        frame_edit = ttk.LabelFrame(builder_win, text="添加步骤")
+        frame_edit.pack(fill='x', padx=10, pady=5)
+        
+        # 步骤类型选择
+        ttk.Label(frame_edit, text="类型:").grid(row=0, column=0, padx=5, pady=5)
+        self.step_type = ttk.Combobox(frame_edit, values=["移动", "点击", "图像点击", "等待", "键盘输入"], state="readonly")
+        self.step_type.grid(row=0, column=1, padx=5, pady=5)
+        self.step_type.current(0)
+        self.step_type.bind("<<ComboboxSelected>>", self.on_step_type_change)
+        
+        # 参数输入区域（动态变化）
+        self.param_frame = ttk.Frame(frame_edit)
+        self.param_frame.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky='ew')
+        
+        # 初始化参数控件
+        self.create_move_params()
+        
+        # 添加按钮
+        btn_add = ttk.Button(frame_edit, text="添加步骤", command=self.add_script_step)
+        btn_add.grid(row=2, column=0, columnspan=2, pady=10)
+        
+        # 保存脚本按钮
+        btn_save = ttk.Button(builder_win, text="保存脚本", command=self.save_script)
+        btn_save.pack(pady=5)
+        
+        # 存储当前构建的步骤
+        self.current_steps = []  # 每个元素为字典
+    
+    def delete_selected_step(self):
+        """删除选中的步骤"""
+        selection = self.script_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("提示", "请先选中要删除的步骤")
+            return
+        index = selection[0]
+        del self.current_steps[index]
+        self.script_listbox.delete(index)
+    
+    def on_step_type_change(self, event=None):
+        """切换步骤类型时更新参数输入区域"""
+        # 清空 param_frame
+        for widget in self.param_frame.winfo_children():
+            widget.destroy()
+        
+        step_type = self.step_type.get()
+        if step_type == "移动":
+            self.create_move_params()
+        elif step_type == "点击":
+            self.create_click_params()
+        elif step_type == "图像点击":
+            self.create_image_click_params()
+        elif step_type == "等待":
+            self.create_wait_params()
+        elif step_type == "键盘输入":
+            self.create_typewrite_params()
+    
+    def create_move_params(self):
+        ttk.Label(self.param_frame, text="X:").grid(row=0, column=0, padx=5)
+        self.move_x = ttk.Entry(self.param_frame, width=10)
+        self.move_x.grid(row=0, column=1, padx=5)
+        ttk.Label(self.param_frame, text="Y:").grid(row=0, column=2, padx=5)
+        self.move_y = ttk.Entry(self.param_frame, width=10)
+        self.move_y.grid(row=0, column=3, padx=5)
+        ttk.Label(self.param_frame, text="持续时间(秒):").grid(row=1, column=0, padx=5)
+        self.move_duration = ttk.Entry(self.param_frame, width=10)
+        self.move_duration.insert(0, "0.2")
+        self.move_duration.grid(row=1, column=1, padx=5)
+    
+    def create_click_params(self):
+        ttk.Label(self.param_frame, text="X(可选):").grid(row=0, column=0, padx=5)
+        self.click_x = ttk.Entry(self.param_frame, width=10)
+        self.click_x.grid(row=0, column=1, padx=5)
+        ttk.Label(self.param_frame, text="Y(可选):").grid(row=0, column=2, padx=5)
+        self.click_y = ttk.Entry(self.param_frame, width=10)
+        self.click_y.grid(row=0, column=3, padx=5)
+        ttk.Label(self.param_frame, text="按键:").grid(row=1, column=0, padx=5)
+        self.click_button = ttk.Combobox(self.param_frame, values=["left", "right", "middle"], width=8)
+        self.click_button.grid(row=1, column=1, padx=5)
+        self.click_button.current(0)
+        ttk.Label(self.param_frame, text="点击次数:").grid(row=1, column=2, padx=5)
+        self.click_clicks = ttk.Entry(self.param_frame, width=5)
+        self.click_clicks.insert(0, "1")
+        self.click_clicks.grid(row=1, column=3, padx=5)
+    
+    def create_image_click_params(self):
+        ttk.Label(self.param_frame, text="图片路径:").grid(row=0, column=0, padx=5)
+        self.image_path = ttk.Entry(self.param_frame, width=30)
+        self.image_path.grid(row=0, column=1, padx=5)
+        btn_browse = ttk.Button(self.param_frame, text="浏览", command=self.browse_image)
+        btn_browse.grid(row=0, column=2, padx=5)
+        ttk.Label(self.param_frame, text="置信度:").grid(row=1, column=0, padx=5)
+        self.image_confidence = ttk.Entry(self.param_frame, width=10)
+        self.image_confidence.insert(0, "0.8")
+        self.image_confidence.grid(row=1, column=1, padx=5)
+        ttk.Label(self.param_frame, text="按键:").grid(row=1, column=2, padx=5)
+        self.image_button = ttk.Combobox(self.param_frame, values=["left", "right", "middle"], width=8)
+        self.image_button.grid(row=1, column=3, padx=5)
+        self.image_button.current(0)
+        # 提示信息
+        if not HAS_CV2:
+            ttk.Label(self.param_frame, text="⚠️ 未安装 opencv-python", foreground="red").grid(row=2, column=0, columnspan=4, pady=5)
+    
+    def create_wait_params(self):
+        ttk.Label(self.param_frame, text="等待秒数:").grid(row=0, column=0, padx=5)
+        self.wait_seconds = ttk.Entry(self.param_frame, width=10)
+        self.wait_seconds.insert(0, "1.0")
+        self.wait_seconds.grid(row=0, column=1, padx=5)
+    
+    def create_typewrite_params(self):
+        ttk.Label(self.param_frame, text="文本:").grid(row=0, column=0, padx=5)
+        self.type_text = ttk.Entry(self.param_frame, width=30)
+        self.type_text.grid(row=0, column=1, padx=5)
+        ttk.Label(self.param_frame, text="间隔(秒):").grid(row=1, column=0, padx=5)
+        self.type_interval = ttk.Entry(self.param_frame, width=10)
+        self.type_interval.insert(0, "0.1")
+        self.type_interval.grid(row=1, column=1, padx=5)
+    
+    def browse_image(self):
+        filename = filedialog.askopenfilename(filetypes=[("图片", "*.png *.jpg *.jpeg *.bmp")])
+        if filename:
+            self.image_path.delete(0, tk.END)
+            self.image_path.insert(0, filename)
+    
+    def add_script_step(self):
+        """根据当前选择的类型和参数，添加步骤到列表"""
+        step_type = self.step_type.get()
+        step = {}
+        try:
+            if step_type == "移动":
+                x = int(self.move_x.get())
+                y = int(self.move_y.get())
+                duration = float(self.move_duration.get())
+                step = {"type": "move", "x": x, "y": y, "duration": duration}
+            elif step_type == "点击":
+                x = self.click_x.get().strip()
+                y = self.click_y.get().strip()
+                button = self.click_button.get()
+                clicks = int(self.click_clicks.get())
+                step = {"type": "click", "button": button, "clicks": clicks}
+                if x:
+                    step["x"] = int(x)
+                if y:
+                    step["y"] = int(y)
+            elif step_type == "图像点击":
+                img_path = self.image_path.get().strip()
+                if not img_path:
+                    messagebox.showwarning("提示", "请选择图片")
+                    return
+                confidence = float(self.image_confidence.get())
+                button = self.image_button.get()
+                step = {"type": "image_click", "image_path": img_path, "confidence": confidence, "button": button}
+            elif step_type == "等待":
+                seconds = float(self.wait_seconds.get())
+                step = {"type": "wait", "seconds": seconds}
+            elif step_type == "键盘输入":
+                text = self.type_text.get()
+                interval = float(self.type_interval.get())
+                step = {"type": "typewrite", "text": text, "interval": interval}
+            else:
+                return
+        except ValueError as e:
+            messagebox.showerror("错误", f"参数格式错误: {e}")
+            return
+        
+        self.current_steps.append(step)
+        # 显示步骤摘要
+        summary = f"{len(self.current_steps)}. {step_type}: {step}"
+        self.script_listbox.insert(tk.END, summary)
+        # 可不清空输入，以便连续添加同类步骤
+    
+    def save_script(self):
+        if not self.current_steps:
+            messagebox.showwarning("提示", "请先添加步骤")
+            return
+        
+        name = simpledialog.askstring("保存脚本", "请输入脚本名称:", parent=self.root)
+        if not name:
+            return
+        desc = simpledialog.askstring("保存脚本", "请输入脚本描述:", parent=self.root) or ""
+        
+        # 保存到文件
+        file_path = config.RECORDINGS_DIR / f"{name}.json"
+        builder = ScriptBuilder()
+        builder.steps = self.current_steps
+        builder.save(file_path)
+        
+        # 添加到行为库
+        self.behavior_lib.add_behavior(name, desc, str(file_path))
+        messagebox.showinfo("成功", f"脚本 '{name}' 已保存并加入行为库")
+        
+        # 刷新行为仓库列表
+        self.refresh_behavior_list()
+        # 关闭窗口
+        self.script_listbox.master.destroy()
+    
+    # ---------- 行为仓库标签页 ----------
+    def create_behavior_repo_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="行为仓库")
+        
+        frame_search = ttk.LabelFrame(tab, text="搜索行为")
+        frame_search.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Label(frame_search, text="关键词:").pack(side='left', padx=5)
+        self.behavior_search_entry = ttk.Entry(frame_search, width=40)
+        self.behavior_search_entry.pack(side='left', padx=5)
+        ttk.Button(frame_search, text="搜索", command=self.search_behavior_repo).pack(side='left', padx=5)
+        ttk.Button(frame_search, text="显示全部", command=self.refresh_behavior_list).pack(side='left', padx=5)
+        
+        # 中间：行为列表
+        frame_list = ttk.LabelFrame(tab, text="已存储的行为")
+        frame_list.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        columns = ("选中", "序号", "名称", "描述", "创建时间", "操作")
+        self.behavior_tree = ttk.Treeview(frame_list, columns=columns, show="headings", height=15)
+        
+        self.behavior_tree.heading("选中", text="✓")
+        self.behavior_tree.heading("序号", text="#")
+        self.behavior_tree.heading("名称", text="行为名称")
+        self.behavior_tree.heading("描述", text="描述")
+        self.behavior_tree.heading("创建时间", text="创建时间")
+        self.behavior_tree.heading("操作", text="操作")
+        
+        self.behavior_tree.column("选中", width=30, anchor='center')
+        self.behavior_tree.column("序号", width=40, anchor='center')
+        self.behavior_tree.column("名称", width=150)
+        self.behavior_tree.column("描述", width=350)
+        self.behavior_tree.column("创建时间", width=120, anchor='center')
+        self.behavior_tree.column("操作", width=150, anchor='center')
+        
+        scrollbar = ttk.Scrollbar(frame_list, orient="vertical", command=self.behavior_tree.yview)
+        self.behavior_tree.configure(yscrollcommand=scrollbar.set)
+        self.behavior_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        self.behavior_tree.bind('<ButtonRelease-1>', self.on_behavior_tree_click)
+        
+        frame_bottom = ttk.Frame(tab)
+        frame_bottom.pack(fill='x', padx=10, pady=5)
+        
+        btn_delete_selected = ttk.Button(frame_bottom, text="删除选中", command=self.delete_selected_behaviors)
+        btn_delete_selected.pack(side='left', padx=5)
+        
+        btn_clear_all = ttk.Button(frame_bottom, text="清空全部", command=self.clear_all_behaviors)
+        btn_clear_all.pack(side='left', padx=5)
+        
+        btn_refresh = ttk.Button(frame_bottom, text="刷新列表", command=self.refresh_behavior_list)
+        btn_refresh.pack(side='left', padx=5)
+        
+        self.refresh_behavior_list()
+    
+    def refresh_behavior_list(self):
+        print("刷新行为列表...")
+        for row in self.behavior_tree.get_children():
+            self.behavior_tree.delete(row)
+        
+        behaviors = self.behavior_lib.get_all()
+        print(f"获取到 {len(behaviors)} 个行为")
+        
+        if not behaviors:
+            self.behavior_tree.insert('', 'end', values=('', '', '暂无行为', '请先录制并保存行为', '', ''))
+            return
+        
+        for idx, behavior in enumerate(behaviors):
+            desc = behavior.get('description', '')
+            if len(desc) > 50:
+                desc = desc[:50] + "..."
+            
+            item_id = self.behavior_tree.insert('', 'end', values=(
+                '□',
+                idx + 1,
+                behavior['name'],
+                desc,
+                behavior.get('created_at', '未知'),
+                '[执行]  [删除]'
+            ))
+            self.behavior_tree.item(item_id, tags=(str(idx),))
+    
+    def search_behavior_repo(self):
+        query = self.behavior_search_entry.get().strip()
+        if not query:
+            self.refresh_behavior_list()
+            return
+        
+        results = self.behavior_lib.search_behavior(query, top_k=10)
+        
+        for row in self.behavior_tree.get_children():
+            self.behavior_tree.delete(row)
+        
+        if not results:
+            self.behavior_tree.insert('', 'end', values=('', '', '未找到', f'没有匹配 "{query}" 的行为', '', ''))
+            return
+        
+        for idx, res in enumerate(results):
+            desc = res['description']
+            if len(desc) > 50:
+                desc = desc[:50] + "..."
+            
+            self.behavior_tree.insert('', 'end', values=(
+                '□',
+                idx + 1,
+                f"{res['name']} (相似度: {res['score']:.2f})",
+                desc,
+                res.get('created_at', '未知'),
+                '[执行]  [删除]'
+            ), tags=(str(res['index']),))
+    
+    def on_behavior_tree_click(self, event):
+        region = self.behavior_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        
+        column = self.behavior_tree.identify_column(event.x)
+        row_id = self.behavior_tree.identify_row(event.y)
+        if not row_id:
+            return
+        
+        tags = self.behavior_tree.item(row_id, 'tags')
+        if not tags:
+            return
+        
+        try:
+            original_idx = int(tags[0])
+        except ValueError:
+            return
+        
+        if column == '#6':  # 操作列
+            # 获取该列的边界
+            bbox = self.behavior_tree.bbox(row_id, column='#6')
+            if not bbox:
+                return
+            col_x, col_y, col_width, col_height = bbox
+            relative_x = event.x - col_x
+            if relative_x < 70:  # 点击了"执行"
+                self.execute_behavior_by_index(original_idx)
+            else:  # 点击了"删除"
+                values = self.behavior_tree.item(row_id, 'values')
+                name = values[2] if len(values) > 2 else "未知"
+                if messagebox.askyesno("确认删除", f"确定要删除行为 '{name}' 吗？"):
+                    if self.behavior_lib.delete(original_idx):
+                        messagebox.showinfo("成功", "行为已删除")
+                        self.refresh_behavior_list()
+                    else:
+                        messagebox.showerror("错误", "删除失败")
+        
+        elif column == '#1':  # 选中列
+            values = self.behavior_tree.item(row_id, 'values')
+            current_val = values[0] if values else '□'
+            new_val = '☑' if current_val == '□' else '□'
+            self.behavior_tree.set(row_id, column='选中', value=new_val)
+    
+    def execute_behavior_by_index(self, index: int):
+        behaviors = self.behavior_lib.get_all()
+        if index < 0 or index >= len(behaviors):
+            messagebox.showerror("错误", "行为索引无效")
+            return
+        
+        behavior = behaviors[index]
+        file_path = behavior['file_path']
+        name = behavior['name']
+        speed = self.replay_speed.get()
+        
+        print(f"执行行为: {name}, 文件: {file_path}, 速度: {speed}x")
+        
+        def replay_task():
+            try:
+                replay_mouse(file_path, speed_factor=speed)
+                self.root.after(0, lambda: messagebox.showinfo("完成", f"行为 '{name}' 执行完成"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"执行失败: {e}"))
+        
+        threading.Thread(target=replay_task, daemon=True).start()
+    
+    def delete_selected_behaviors(self):
+        selected_indices = []
+        for row_id in self.behavior_tree.get_children():
+            values = self.behavior_tree.item(row_id, 'values')
+            if values and values[0] == '☑':
+                tags = self.behavior_tree.item(row_id, 'tags')
+                if tags:
+                    try:
+                        selected_indices.append(int(tags[0]))
+                    except ValueError:
+                        pass
+        
+        if not selected_indices:
+            messagebox.showwarning("提示", "请先勾选要删除的行为")
+            return
+        
+        if messagebox.askyesno("确认删除", f"确定要删除选中的 {len(selected_indices)} 条行为吗？"):
+            for idx in sorted(selected_indices, reverse=True):
+                self.behavior_lib.delete(idx)
+            self.refresh_behavior_list()
+            messagebox.showinfo("成功", f"已删除 {len(selected_indices)} 条行为")
+    
+    def clear_all_behaviors(self):
+        if messagebox.askyesno("警告", "确定要清空所有行为吗？此操作不可恢复！"):
+            self.behavior_lib.clear_all()
+            self.refresh_behavior_list()
+            messagebox.showinfo("成功", "所有行为已清空")
+    
     # ---------- 记忆管理标签页 ----------
     def create_memory_tab(self):
-        """记忆管理标签页（完整 CRUD）"""
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="记忆管理")
 
-        # ========== 顶部：手动添加记忆 ==========
         frame_add = ttk.LabelFrame(tab, text="添加新记忆")
         frame_add.pack(fill='x', padx=10, pady=5)
 
@@ -230,42 +672,34 @@ class App:
         btn_add.grid(row=0, column=2, padx=5, pady=5)
         frame_add.grid_columnconfigure(1, weight=1)
 
-        # ========== 中间：记忆列表（可多选删除） ==========
         frame_list = ttk.LabelFrame(tab, text="已存储的记忆")
         frame_list.pack(fill='both', expand=True, padx=10, pady=5)
 
-        # 创建 Treeview，添加复选框列
         columns = ("选中", "序号", "内容", "来源", "操作")
         self.memory_tree = ttk.Treeview(frame_list, columns=columns, show="headings", height=15)
         
-        # 设置列标题
-        self.memory_tree.heading("选中", text="✅")
+        self.memory_tree.heading("选中", text="✓")
         self.memory_tree.heading("序号", text="#")
         self.memory_tree.heading("内容", text="记忆内容")
         self.memory_tree.heading("来源", text="来源")
         self.memory_tree.heading("操作", text="删除")
         
-        # 设置列宽
-        self.memory_tree.column("选中", width=40, anchor='center')
-        self.memory_tree.column("序号", width=50, anchor='center')
-        self.memory_tree.column("内容", width=450)
+        self.memory_tree.column("选中", width=30, anchor='center')
+        self.memory_tree.column("序号", width=40, anchor='center')
+        self.memory_tree.column("内容", width=500)
         self.memory_tree.column("来源", width=100)
         self.memory_tree.column("操作", width=80, anchor='center')
 
-        # 滚动条
         scrollbar = ttk.Scrollbar(frame_list, orient="vertical", command=self.memory_tree.yview)
         self.memory_tree.configure(yscrollcommand=scrollbar.set)
         self.memory_tree.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        # 绑定点击事件（用于复选框切换和删除按钮）
         self.memory_tree.bind('<ButtonRelease-1>', self.on_memory_tree_click)
 
-        # ========== 底部：操作按钮 + 检索 ==========
         frame_bottom = ttk.Frame(tab)
         frame_bottom.pack(fill='x', padx=10, pady=5)
 
-        # 左侧按钮组
         btn_frame = ttk.Frame(frame_bottom)
         btn_frame.pack(side='left', fill='x', expand=True)
         
@@ -278,7 +712,6 @@ class App:
         btn_refresh = ttk.Button(btn_frame, text="刷新列表", command=self.refresh_memory_list)
         btn_refresh.pack(side='left', padx=5)
 
-        # 右侧检索框
         search_frame = ttk.Frame(frame_bottom)
         search_frame.pack(side='right')
         ttk.Label(search_frame, text="检索:").pack(side='left')
@@ -287,40 +720,29 @@ class App:
         btn_search = ttk.Button(search_frame, text="搜索", command=self.search_memory)
         btn_search.pack(side='left')
         
-        # 初始化显示列表
         self.refresh_memory_list()
     
     def refresh_memory_list(self):
-        """刷新记忆列表（从 memory 对象加载最新数据）"""
-        # 清空现有行
         for row in self.memory_tree.get_children():
             self.memory_tree.delete(row)
         
-        # 获取所有记忆
         memories = self.memory.get_all_memories(limit=100)
         
-        # 插入数据
         for idx, mem in enumerate(memories):
-            # 内容截断显示
             content = mem['text']
-            if len(content) > 60:
-                content = content[:60] + "..."
+            if len(content) > 70:
+                content = content[:70] + "..."
             
-            # 插入行，第0列留空（复选框用变量存储状态）
             item_id = self.memory_tree.insert('', 'end', values=(
-                '□',          # 复选框（未选中）
-                idx + 1,      # 序号
+                '□',
+                idx + 1,
                 content,
                 mem['source'],
-                '🗑️ 删除'     # 删除按钮文本
+                '[删除]'
             ))
-            # 存储完整内容以备查看
-            self.memory_tree.set(item_id, column='内容', value=content)
-            # 可以将完整内容作为隐藏数据存储（可选）
-            self.memory_tree.item(item_id, tags=(str(idx),))  # 用 tags 存储原始索引
+            self.memory_tree.item(item_id, tags=(str(idx),))
 
     def add_memory(self):
-        """手动添加记忆"""
         content = self.new_memory_entry.get().strip()
         if not content:
             messagebox.showwarning("提示", "请输入记忆内容")
@@ -334,7 +756,6 @@ class App:
             messagebox.showerror("错误", f"添加失败: {e}")
 
     def on_memory_tree_click(self, event):
-        """处理 Treeview 点击事件（复选框切换、删除按钮）"""
         region = self.memory_tree.identify_region(event.x, event.y)
         if region != "cell":
             return
@@ -344,11 +765,9 @@ class App:
         if not row_id:
             return
         
-        # 点击“操作”列（删除按钮）
-        if column == '#5':  # 第5列是“操作”
-            # 获取该行的原始索引（从 tags 或序号）
+        if column == '#5':  # 操作列（删除）
             item_values = self.memory_tree.item(row_id, 'values')
-            idx = int(item_values[1]) - 1  # 序号从1开始，转0基
+            idx = int(item_values[1]) - 1
             if messagebox.askyesno("确认删除", f"确定要删除这条记忆吗？"):
                 if self.memory.delete_memory(idx):
                     messagebox.showinfo("成功", "记忆已删除")
@@ -357,14 +776,12 @@ class App:
                     messagebox.showerror("错误", "删除失败")
             return
         
-        # 点击“选中”列（复选框）
-        if column == '#1':
+        if column == '#1':  # 选中列
             current_val = self.memory_tree.item(row_id, 'values')[0]
             new_val = '☑' if current_val == '□' else '□'
             self.memory_tree.set(row_id, column='选中', value=new_val)
 
     def delete_selected_memories(self):
-        """删除所有被选中的记忆"""
         selected_indices = []
         for row_id in self.memory_tree.get_children():
             if self.memory_tree.item(row_id, 'values')[0] == '☑':
@@ -375,7 +792,6 @@ class App:
             messagebox.showwarning("提示", "请先勾选要删除的记忆")
             return
         
-        # 从后往前删除，避免索引变化
         if messagebox.askyesno("确认删除", f"确定要删除选中的 {len(selected_indices)} 条记忆吗？"):
             for idx in sorted(selected_indices, reverse=True):
                 self.memory.delete_memory(idx)
@@ -383,14 +799,12 @@ class App:
             messagebox.showinfo("成功", f"已删除 {len(selected_indices)} 条记忆")
 
     def clear_all_memories(self):
-        """清空所有记忆"""
         if messagebox.askyesno("警告", "确定要清空所有记忆吗？此操作不可恢复！"):
             self.memory.clear_all()
             self.refresh_memory_list()
             messagebox.showinfo("成功", "所有记忆已清空")
 
     def search_memory(self):
-        """检索记忆并显示结果"""
         query = self.memory_search_entry.get().strip()
         if not query:
             messagebox.showwarning("提示", "请输入检索关键词")
@@ -398,7 +812,6 @@ class App:
         
         results = self.memory.retrieve_relevant(query, top_k=10)
         
-        # 清空现有列表，显示检索结果
         for row in self.memory_tree.get_children():
             self.memory_tree.delete(row)
         
@@ -408,14 +821,14 @@ class App:
         
         for idx, res in enumerate(results):
             content = res['text']
-            if len(content) > 60:
-                content = content[:60] + "..."
+            if len(content) > 70:
+                content = content[:70] + "..."
             self.memory_tree.insert('', 'end', values=(
                 '□',
                 idx + 1,
                 content,
                 f"{res['source']} (相似度{res['score']:.2f})",
-                '🗑️ 删除'
+                '[删除]'
             ))
     
     # ---------- 设置 ----------
@@ -426,13 +839,12 @@ class App:
         ttk.Label(dialog, text="DeepSeek API Key:").pack(pady=10)
         key_entry = ttk.Entry(dialog, width=50)
         key_entry.pack(pady=5)
-        key_entry.insert(0, config.DEEPSEEK_API_KEY)  # 显示当前密钥
+        key_entry.insert(0, config.DEEPSEEK_API_KEY)
         
         def save_key():
             new_key = key_entry.get().strip()
             if new_key:
                 config.DEEPSEEK_API_KEY = new_key
-                # 更新RAG中的llm实例（重新创建）
                 self.rag.llm = DeepSeekAPI(new_key)
                 messagebox.showinfo("成功", "API密钥已更新")
                 dialog.destroy()
@@ -440,7 +852,6 @@ class App:
         ttk.Button(dialog, text="保存", command=save_key).pack(pady=10)
 
 
-# 启动主程序
 def run_gui():
     root = tk.Tk()
     app = App(root)
