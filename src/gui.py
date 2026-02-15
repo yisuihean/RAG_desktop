@@ -8,7 +8,8 @@ from .document_processor import parse_document, split_text
 from .automation import MouseRecorder, BehaviorLibrary, replay_mouse, ScriptBuilder, HAS_CV2
 from .memory import ConversationMemory
 from .models import DeepSeekAPI, EmbeddingModel
-from .config_manager import set_api_key as save_api_key, get_api_key  # 新增导入
+from .config_manager import set_api_key as save_api_key, get_api_key
+import faiss
 
 class App:
     def __init__(self, root):
@@ -34,6 +35,7 @@ class App:
         self.create_automation_tab()
         self.create_behavior_repo_tab()
         self.create_memory_tab()
+        self.create_documents_tab()          # 新增：文档管理标签页
         
         # 菜单栏（设置API Key）
         menubar = tk.Menu(root)
@@ -45,7 +47,7 @@ class App:
         # 启动时检查 API key 是否已设置
         if not config.DEEPSEEK_API_KEY:
             self.root.after(100, lambda: messagebox.showwarning("提示", "请先设置 DeepSeek API 密钥"))
-            self.root.after(200, self.set_api_key)  # 延迟弹出设置窗口
+            self.root.after(200, self.set_api_key)
     
     def on_recording_stopped(self, event_count):
         """当录制停止时的回调函数（F2 触发或按钮触发）"""
@@ -65,8 +67,8 @@ class App:
         # 上传文件区域
         frame_upload = ttk.LabelFrame(tab, text="上传文档")
         frame_upload.pack(fill='x', padx=10, pady=5)
-        btn_upload = ttk.Button(frame_upload, text="选择文件", command=self.upload_document)
-        btn_upload.pack(side='left', padx=5, pady=5)
+        self.btn_upload = ttk.Button(frame_upload, text="选择文件", command=self.upload_document)
+        self.btn_upload.pack(side='left', padx=5, pady=5)
         self.lbl_upload_status = ttk.Label(frame_upload, text="未上传文件")
         self.lbl_upload_status.pack(side='left', padx=5)
         
@@ -87,21 +89,41 @@ class App:
         frame_qa.grid_rowconfigure(1, weight=1)
     
     def upload_document(self):
+        """异步上传文档，避免界面卡死"""
         file_path = filedialog.askopenfilename(
             title="选择文档",
             filetypes=[("文档", "*.pdf *.md *.txt"), ("PDF", "*.pdf"), ("Markdown", "*.md"), ("文本", "*.txt")]
         )
         if not file_path:
             return
-        try:
-            text = parse_document(file_path)
-            chunks = split_text(text)
-            sources = [Path(file_path).name] * len(chunks)
-            self.rag.doc_store.add_documents(chunks, sources)
-            self.lbl_upload_status.config(text=f"已上传并索引: {Path(file_path).name} ({len(chunks)}块)")
-            messagebox.showinfo("成功", "文档已处理并加入知识库")
-        except Exception as e:
-            messagebox.showerror("错误", f"处理失败: {e}")
+        
+        # 禁用按钮，显示处理中状态
+        self.btn_upload.config(state='disabled', text="处理中...")
+        self.lbl_upload_status.config(text="正在解析文档，请稍候...")
+        
+        def task():
+            try:
+                text = parse_document(file_path)
+                chunks = split_text(text)
+                sources = [Path(file_path).name] * len(chunks)
+                self.rag.doc_store.add_documents(chunks, sources)
+                # 处理完成后更新UI
+                self.root.after(0, self._upload_success, file_path, len(chunks))
+            except Exception as e:
+                self.root.after(0, self._upload_error, str(e))
+        
+        threading.Thread(target=task, daemon=True).start()
+    
+    def _upload_success(self, file_path, chunk_count):
+        self.btn_upload.config(state='normal', text="选择文件")
+        self.lbl_upload_status.config(text=f"已上传并索引: {Path(file_path).name} ({chunk_count}块)")
+        messagebox.showinfo("成功", "文档已处理并加入知识库")
+        self.refresh_document_list()   # 刷新文档管理列表
+    
+    def _upload_error(self, error_msg):
+        self.btn_upload.config(state='normal', text="选择文件")
+        self.lbl_upload_status.config(text="上传失败")
+        messagebox.showerror("错误", f"处理失败: {error_msg}")
     
     def ask_question(self):
         question = self.question_entry.get().strip()
@@ -144,7 +166,6 @@ class App:
         btn_save = ttk.Button(frame_save, text="保存轨迹", command=self.save_behavior)
         btn_save.pack(side='left', padx=5)
         
-        # 新增：新建脚本按钮
         btn_new_script = ttk.Button(frame_record, text="新建脚本", command=self.open_script_builder)
         btn_new_script.pack(side='left', padx=5)
         
@@ -157,7 +178,6 @@ class App:
         speed_scale.pack(side='left', padx=5)
         self.speed_label = ttk.Label(frame_speed, text="1.0x")
         self.speed_label.pack(side='left', padx=5)
-        # 更新速度显示
         def update_speed_label(*args):
             self.speed_label.config(text=f"{self.replay_speed.get():.1f}x")
         self.replay_speed.trace_add('write', update_speed_label)
@@ -239,7 +259,6 @@ class App:
         
         threading.Thread(target=replay_task, daemon=True).start()
     
-    # ---------- 新增：脚本构建窗口 ----------
     def open_script_builder(self):
         """打开脚本构建器窗口"""
         builder_win = tk.Toplevel(self.root)
@@ -250,14 +269,12 @@ class App:
         frame_list = ttk.LabelFrame(builder_win, text="步骤列表")
         frame_list.pack(fill='both', expand=True, padx=10, pady=5)
         
-        # 使用 Listbox 显示步骤
         self.script_listbox = tk.Listbox(frame_list, height=8)
         self.script_listbox.pack(side='left', fill='both', expand=True, padx=5, pady=5)
         scrollbar = ttk.Scrollbar(frame_list, orient='vertical', command=self.script_listbox.yview)
         scrollbar.pack(side='right', fill='y')
         self.script_listbox.config(yscrollcommand=scrollbar.set)
         
-        # 删除按钮
         btn_delete_step = ttk.Button(frame_list, text="删除选中步骤", command=self.delete_selected_step)
         btn_delete_step.pack(pady=5)
         
@@ -265,33 +282,26 @@ class App:
         frame_edit = ttk.LabelFrame(builder_win, text="添加步骤")
         frame_edit.pack(fill='x', padx=10, pady=5)
         
-        # 步骤类型选择
         ttk.Label(frame_edit, text="类型:").grid(row=0, column=0, padx=5, pady=5)
         self.step_type = ttk.Combobox(frame_edit, values=["移动", "点击", "图像点击", "等待", "键盘输入"], state="readonly")
         self.step_type.grid(row=0, column=1, padx=5, pady=5)
         self.step_type.current(0)
         self.step_type.bind("<<ComboboxSelected>>", self.on_step_type_change)
         
-        # 参数输入区域（动态变化）
         self.param_frame = ttk.Frame(frame_edit)
         self.param_frame.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky='ew')
         
-        # 初始化参数控件
         self.create_move_params()
         
-        # 添加按钮
         btn_add = ttk.Button(frame_edit, text="添加步骤", command=self.add_script_step)
         btn_add.grid(row=2, column=0, columnspan=2, pady=10)
         
-        # 保存脚本按钮
         btn_save = ttk.Button(builder_win, text="保存脚本", command=self.save_script)
         btn_save.pack(pady=5)
         
-        # 存储当前构建的步骤
-        self.current_steps = []  # 每个元素为字典
+        self.current_steps = []
     
     def delete_selected_step(self):
-        """删除选中的步骤"""
         selection = self.script_listbox.curselection()
         if not selection:
             messagebox.showwarning("提示", "请先选中要删除的步骤")
@@ -301,11 +311,8 @@ class App:
         self.script_listbox.delete(index)
     
     def on_step_type_change(self, event=None):
-        """切换步骤类型时更新参数输入区域"""
-        # 清空 param_frame
         for widget in self.param_frame.winfo_children():
             widget.destroy()
-        
         step_type = self.step_type.get()
         if step_type == "移动":
             self.create_move_params()
@@ -360,7 +367,6 @@ class App:
         self.image_button = ttk.Combobox(self.param_frame, values=["left", "right", "middle"], width=8)
         self.image_button.grid(row=1, column=3, padx=5)
         self.image_button.current(0)
-        # 提示信息
         if not HAS_CV2:
             ttk.Label(self.param_frame, text="⚠️ 未安装 opencv-python", foreground="red").grid(row=2, column=0, columnspan=4, pady=5)
     
@@ -386,7 +392,6 @@ class App:
             self.image_path.insert(0, filename)
     
     def add_script_step(self):
-        """根据当前选择的类型和参数，添加步骤到列表"""
         step_type = self.step_type.get()
         step = {}
         try:
@@ -427,10 +432,8 @@ class App:
             return
         
         self.current_steps.append(step)
-        # 显示步骤摘要
         summary = f"{len(self.current_steps)}. {step_type}: {step}"
         self.script_listbox.insert(tk.END, summary)
-        # 可不清空输入，以便连续添加同类步骤
     
     def save_script(self):
         if not self.current_steps:
@@ -442,19 +445,14 @@ class App:
             return
         desc = simpledialog.askstring("保存脚本", "请输入脚本描述:", parent=self.root) or ""
         
-        # 保存到文件
         file_path = config.RECORDINGS_DIR / f"{name}.json"
         builder = ScriptBuilder()
         builder.steps = self.current_steps
         builder.save(file_path)
         
-        # 添加到行为库
         self.behavior_lib.add_behavior(name, desc, str(file_path))
         messagebox.showinfo("成功", f"脚本 '{name}' 已保存并加入行为库")
-        
-        # 刷新行为仓库列表
         self.refresh_behavior_list()
-        # 关闭窗口
         self.script_listbox.master.destroy()
     
     # ---------- 行为仓库标签页 ----------
@@ -471,7 +469,6 @@ class App:
         ttk.Button(frame_search, text="搜索", command=self.search_behavior_repo).pack(side='left', padx=5)
         ttk.Button(frame_search, text="显示全部", command=self.refresh_behavior_list).pack(side='left', padx=5)
         
-        # 中间：行为列表
         frame_list = ttk.LabelFrame(tab, text="已存储的行为")
         frame_list.pack(fill='both', expand=True, padx=10, pady=5)
         
@@ -589,15 +586,14 @@ class App:
             return
         
         if column == '#6':  # 操作列
-            # 获取该列的边界
             bbox = self.behavior_tree.bbox(row_id, column='#6')
             if not bbox:
                 return
             col_x, col_y, col_width, col_height = bbox
             relative_x = event.x - col_x
-            if relative_x < 70:  # 点击了"执行"
+            if relative_x < 70:  # 执行
                 self.execute_behavior_by_index(original_idx)
-            else:  # 点击了"删除"
+            else:  # 删除
                 values = self.behavior_tree.item(row_id, 'values')
                 name = values[2] if len(values) > 2 else "未知"
                 if messagebox.askyesno("确认删除", f"确定要删除行为 '{name}' 吗？"):
@@ -837,7 +833,124 @@ class App:
                 '[删除]'
             ))
     
-    # ---------- 修改后的设置方法 ----------
+    # ---------- 新增：文档管理标签页 ----------
+    def create_documents_tab(self):
+        """文档管理标签页：查看和管理已上传的文档"""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="文档管理")
+        
+        # 文档列表
+        frame_list = ttk.LabelFrame(tab, text="已上传文档")
+        frame_list.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        columns = ("文件名", "大小", "状态")
+        self.doc_tree = ttk.Treeview(frame_list, columns=columns, show="headings", height=15)
+        
+        self.doc_tree.heading("文件名", text="文件名")
+        self.doc_tree.heading("大小", text="大小")
+        self.doc_tree.heading("状态", text="状态")
+        
+        self.doc_tree.column("文件名", width=300)
+        self.doc_tree.column("大小", width=100, anchor='center')
+        self.doc_tree.column("状态", width=100, anchor='center')
+        
+        scrollbar = ttk.Scrollbar(frame_list, orient="vertical", command=self.doc_tree.yview)
+        self.doc_tree.configure(yscrollcommand=scrollbar.set)
+        self.doc_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        frame_bottom = ttk.Frame(tab)
+        frame_bottom.pack(fill='x', padx=10, pady=5)
+        
+        btn_refresh = ttk.Button(frame_bottom, text="刷新列表", command=self.refresh_document_list)
+        btn_refresh.pack(side='left', padx=5)
+        
+        btn_delete = ttk.Button(frame_bottom, text="删除选中", command=self.delete_selected_document)
+        btn_delete.pack(side='left', padx=5)
+        
+        btn_clear = ttk.Button(frame_bottom, text="清空所有", command=self.clear_all_documents)
+        btn_clear.pack(side='left', padx=5)
+        
+        self.refresh_document_list()
+
+    def refresh_document_list(self):
+        """刷新文档列表"""
+        for row in self.doc_tree.get_children():
+            self.doc_tree.delete(row)
+        
+        if hasattr(self.rag.doc_store, 'metadata') and self.rag.doc_store.metadata:
+            file_stats = {}
+            for item in self.rag.doc_store.metadata:
+                source = item.get('source', '未知')
+                if source not in file_stats:
+                    file_stats[source] = {
+                        'count': 1,
+                        'size': len(item.get('text', ''))
+                    }
+                else:
+                    file_stats[source]['count'] += 1
+                    file_stats[source]['size'] += len(item.get('text', ''))
+            
+            for filename, stats in file_stats.items():
+                size_kb = stats['size'] / 1024
+                if size_kb < 1024:
+                    size_str = f"{size_kb:.1f} KB"
+                else:
+                    size_str = f"{size_kb/1024:.1f} MB"
+                
+                self.doc_tree.insert('', 'end', values=(
+                    filename,
+                    size_str,
+                    f"{stats['count']} 个块"
+                ))
+        else:
+            self.doc_tree.insert('', 'end', values=("暂无文档", "", ""))
+
+    def delete_selected_document(self):
+        """删除选中的文档"""
+        selection = self.doc_tree.selection()
+        if not selection:
+            messagebox.showwarning("提示", "请先选中要删除的文档")
+            return
+        
+        item = self.doc_tree.item(selection[0])
+        filename = item['values'][0]
+        
+        if filename == "暂无文档":
+            return
+        
+        if messagebox.askyesno("确认删除", f"确定要删除文档 '{filename}' 吗？\n这将从知识库中移除所有相关片段。"):
+            # 从 metadata 中删除该文件的所有片段
+            new_metadata = [m for m in self.rag.doc_store.metadata if m.get('source') != filename]
+            
+            if len(new_metadata) < len(self.rag.doc_store.metadata):
+                self.rag.doc_store.metadata = new_metadata
+                
+                # 重建索引
+                if new_metadata:
+                    texts = [item['text'] for item in new_metadata]
+                    vectors = self.rag.doc_store.emb_model.encode(texts)
+                    self.rag.doc_store.index = faiss.IndexFlatIP(self.rag.doc_store.emb_model.dimension)
+                    self.rag.doc_store.index.add(vectors)
+                else:
+                    self.rag.doc_store.index = faiss.IndexFlatIP(self.rag.doc_store.emb_model.dimension)
+                
+                self.rag.doc_store.save()
+                messagebox.showinfo("成功", f"文档 '{filename}' 已删除")
+                self.refresh_document_list()
+            else:
+                messagebox.showinfo("提示", "未找到该文档")
+
+    def clear_all_documents(self):
+        """清空所有文档"""
+        if messagebox.askyesno("警告", "确定要清空所有文档吗？此操作不可恢复！"):
+            self.rag.doc_store.index = faiss.IndexFlatIP(self.rag.doc_store.emb_model.dimension)
+            self.rag.doc_store.metadata = []
+            self.rag.doc_store.save()
+            messagebox.showinfo("成功", "所有文档已清空")
+            self.refresh_document_list()
+    
+    # ---------- 设置 API Key ----------
     def set_api_key(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("设置API密钥")
@@ -845,19 +958,15 @@ class App:
         ttk.Label(dialog, text="DeepSeek API Key:").pack(pady=10)
         key_entry = ttk.Entry(dialog, width=50)
         key_entry.pack(pady=5)
-        # 显示当前保存的 key（如果有）
         current_key = get_api_key()
         key_entry.insert(0, current_key)
         
         def save_key():
             new_key = key_entry.get().strip()
             if new_key:
-                # 保存到配置文件
                 save_api_key(new_key)
-                # 更新内存中的配置变量
                 import src.config as config
                 config.DEEPSEEK_API_KEY = new_key
-                # 重新创建 LLM 实例（使新 key 生效）
                 from .models import DeepSeekAPI
                 self.rag.llm = DeepSeekAPI(new_key)
                 messagebox.showinfo("成功", "API密钥已保存")
