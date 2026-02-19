@@ -173,7 +173,7 @@ class App:
         frame_speed = ttk.LabelFrame(tab, text="回放速度")
         frame_speed.pack(fill='x', padx=10, pady=5)
         ttk.Label(frame_speed, text="速度因子:").pack(side='left', padx=5)
-        speed_scale = ttk.Scale(frame_speed, from_=0.1, to=5.0, orient='horizontal',
+        speed_scale = ttk.Scale(frame_speed, from_=0.1, to=200.0, orient='horizontal',
                                  variable=self.replay_speed, length=200)
         speed_scale.pack(side='left', padx=5)
         self.speed_label = ttk.Label(frame_speed, text="1.0x")
