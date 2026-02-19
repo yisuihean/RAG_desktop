@@ -169,11 +169,11 @@ class App:
         btn_new_script = ttk.Button(frame_record, text="新建脚本", command=self.open_script_builder)
         btn_new_script.pack(side='left', padx=5)
         
-        # 回放速度调节
+        # 回放速度调节（范围扩大至 0.1 ~ 5.0）
         frame_speed = ttk.LabelFrame(tab, text="回放速度")
         frame_speed.pack(fill='x', padx=10, pady=5)
         ttk.Label(frame_speed, text="速度因子:").pack(side='left', padx=5)
-        speed_scale = ttk.Scale(frame_speed, from_=0.2, to=3.0, orient='horizontal',
+        speed_scale = ttk.Scale(frame_speed, from_=0.1, to=5.0, orient='horizontal',
                                  variable=self.replay_speed, length=200)
         speed_scale.pack(side='left', padx=5)
         self.speed_label = ttk.Label(frame_speed, text="1.0x")
@@ -283,7 +283,8 @@ class App:
         frame_edit.pack(fill='x', padx=10, pady=5)
         
         ttk.Label(frame_edit, text="类型:").grid(row=0, column=0, padx=5, pady=5)
-        self.step_type = ttk.Combobox(frame_edit, values=["移动", "点击", "图像点击", "等待", "键盘输入"], state="readonly")
+        # 添加“双击”选项
+        self.step_type = ttk.Combobox(frame_edit, values=["移动", "点击", "双击", "图像点击", "等待", "键盘输入"], state="readonly")
         self.step_type.grid(row=0, column=1, padx=5, pady=5)
         self.step_type.current(0)
         self.step_type.bind("<<ComboboxSelected>>", self.on_step_type_change)
@@ -318,6 +319,8 @@ class App:
             self.create_move_params()
         elif step_type == "点击":
             self.create_click_params()
+        elif step_type == "双击":
+            self.create_double_click_params()
         elif step_type == "图像点击":
             self.create_image_click_params()
         elif step_type == "等待":
@@ -352,6 +355,19 @@ class App:
         self.click_clicks = ttk.Entry(self.param_frame, width=5)
         self.click_clicks.insert(0, "1")
         self.click_clicks.grid(row=1, column=3, padx=5)
+    
+    def create_double_click_params(self):
+        """双击步骤的参数输入"""
+        ttk.Label(self.param_frame, text="X(可选):").grid(row=0, column=0, padx=5)
+        self.double_x = ttk.Entry(self.param_frame, width=10)
+        self.double_x.grid(row=0, column=1, padx=5)
+        ttk.Label(self.param_frame, text="Y(可选):").grid(row=0, column=2, padx=5)
+        self.double_y = ttk.Entry(self.param_frame, width=10)
+        self.double_y.grid(row=0, column=3, padx=5)
+        ttk.Label(self.param_frame, text="按键:").grid(row=1, column=0, padx=5)
+        self.double_button = ttk.Combobox(self.param_frame, values=["left", "right", "middle"], width=8)
+        self.double_button.grid(row=1, column=1, padx=5)
+        self.double_button.current(0)
     
     def create_image_click_params(self):
         ttk.Label(self.param_frame, text="图片路径:").grid(row=0, column=0, padx=5)
@@ -406,6 +422,15 @@ class App:
                 button = self.click_button.get()
                 clicks = int(self.click_clicks.get())
                 step = {"type": "click", "button": button, "clicks": clicks}
+                if x:
+                    step["x"] = int(x)
+                if y:
+                    step["y"] = int(y)
+            elif step_type == "双击":
+                x = self.double_x.get().strip()
+                y = self.double_y.get().strip()
+                button = self.double_button.get()
+                step = {"type": "double_click", "button": button}
                 if x:
                     step["x"] = int(x)
                 if y:
@@ -677,18 +702,21 @@ class App:
         frame_list = ttk.LabelFrame(tab, text="已存储的记忆")
         frame_list.pack(fill='both', expand=True, padx=10, pady=5)
 
-        columns = ("选中", "序号", "内容", "来源", "操作")
+        # 修改列定义：新增“问题”和“答案”列，代替原来的“内容”列
+        columns = ("选中", "序号", "问题", "答案", "来源", "操作")
         self.memory_tree = ttk.Treeview(frame_list, columns=columns, show="headings", height=15)
         
         self.memory_tree.heading("选中", text="✓")
         self.memory_tree.heading("序号", text="#")
-        self.memory_tree.heading("内容", text="记忆内容")
+        self.memory_tree.heading("问题", text="问题")
+        self.memory_tree.heading("答案", text="答案")
         self.memory_tree.heading("来源", text="来源")
         self.memory_tree.heading("操作", text="删除")
         
         self.memory_tree.column("选中", width=30, anchor='center')
         self.memory_tree.column("序号", width=40, anchor='center')
-        self.memory_tree.column("内容", width=500)
+        self.memory_tree.column("问题", width=300)
+        self.memory_tree.column("答案", width=300)
         self.memory_tree.column("来源", width=100)
         self.memory_tree.column("操作", width=80, anchor='center')
 
@@ -731,15 +759,37 @@ class App:
         memories = self.memory.get_all_memories(limit=100)
         
         for idx, mem in enumerate(memories):
-            content = mem['text']
-            if len(content) > 70:
-                content = content[:70] + "..."
+            raw_text = mem['text']
+            source = mem['source']
+            
+            # 解析对话格式（用户: xxx\n助手: yyy）
+            if source == "conversation" and raw_text.startswith("用户:"):
+                # 尝试分割
+                parts = raw_text.split('\n助手:', 1)
+                if len(parts) == 2:
+                    question_part = parts[0].replace("用户:", "").strip()
+                    answer_part = parts[1].strip()
+                else:
+                    # 格式不符，整段放入问题列，答案留空
+                    question_part = raw_text
+                    answer_part = ""
+            else:
+                # 手动添加的记忆，整段放入问题列，答案留空
+                question_part = raw_text
+                answer_part = ""
+            
+            # 过长截断
+            if len(question_part) > 70:
+                question_part = question_part[:70] + "..."
+            if len(answer_part) > 70:
+                answer_part = answer_part[:70] + "..."
             
             item_id = self.memory_tree.insert('', 'end', values=(
                 '□',
                 idx + 1,
-                content,
-                mem['source'],
+                question_part,
+                answer_part,
+                source,
                 '[删除]'
             ))
             self.memory_tree.item(item_id, tags=(str(idx),))
@@ -767,9 +817,10 @@ class App:
         if not row_id:
             return
         
-        if column == '#5':  # 操作列（删除）
+        # 操作列现在是第6列（#6）
+        if column == '#6':
             item_values = self.memory_tree.item(row_id, 'values')
-            idx = int(item_values[1]) - 1
+            idx = int(item_values[1]) - 1  # 序号列是第2列（从1开始计数）
             if messagebox.askyesno("确认删除", f"确定要删除这条记忆吗？"):
                 if self.memory.delete_memory(idx):
                     messagebox.showinfo("成功", "记忆已删除")
@@ -778,7 +829,8 @@ class App:
                     messagebox.showerror("错误", "删除失败")
             return
         
-        if column == '#1':  # 选中列
+        # 选中列是第1列（#1）
+        if column == '#1':
             current_val = self.memory_tree.item(row_id, 'values')[0]
             new_val = '☑' if current_val == '□' else '□'
             self.memory_tree.set(row_id, column='选中', value=new_val)
@@ -818,18 +870,35 @@ class App:
             self.memory_tree.delete(row)
         
         if not results:
-            self.memory_tree.insert('', 'end', values=('', '', '未找到相关记忆', '', ''))
+            self.memory_tree.insert('', 'end', values=('', '', '未找到相关记忆', '', '', ''))
             return
         
         for idx, res in enumerate(results):
-            content = res['text']
-            if len(content) > 70:
-                content = content[:70] + "..."
+            raw_text = res['text']
+            source = res['source']
+            if source == "conversation" and raw_text.startswith("用户:"):
+                parts = raw_text.split('\n助手:', 1)
+                if len(parts) == 2:
+                    question_part = parts[0].replace("用户:", "").strip()
+                    answer_part = parts[1].strip()
+                else:
+                    question_part = raw_text
+                    answer_part = ""
+            else:
+                question_part = raw_text
+                answer_part = ""
+            
+            if len(question_part) > 70:
+                question_part = question_part[:70] + "..."
+            if len(answer_part) > 70:
+                answer_part = answer_part[:70] + "..."
+            
             self.memory_tree.insert('', 'end', values=(
                 '□',
                 idx + 1,
-                content,
-                f"{res['source']} (相似度{res['score']:.2f})",
+                question_part,
+                answer_part,
+                f"{source} (相似度{res['score']:.2f})",
                 '[删除]'
             ))
     
